@@ -29,7 +29,7 @@ That's it! Docker will handle all other dependencies (Kotlin, Neo4j, Redis, etc.
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone --recurse-submodules <repository-url>
 cd lving-kotlin
 ```
 

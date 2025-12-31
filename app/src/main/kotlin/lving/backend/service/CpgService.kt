@@ -1,5 +1,6 @@
 package lving.backend.service
 
+import de.fraunhofer.aisec.cpg.InferenceConfiguration
 import de.fraunhofer.aisec.cpg.TranslationConfiguration
 import de.fraunhofer.aisec.cpg.TranslationManager
 import de.fraunhofer.aisec.cpg.TranslationResult
@@ -54,9 +55,13 @@ class CpgService {
     private fun analyzeLlvmFile(llvmFile: File): TranslationResult {
         println("Starting CPG analysis for file ${llvmFile.absolutePath}")
         try {
+            val inferenceConfig = InferenceConfiguration
+                .builder()
+                .build()
             val translationConfig = TranslationConfiguration.builder()
                 .sourceLocations(listOf(llvmFile))
-//                .defaultPasses()
+               .defaultPasses()
+               .inferenceConfiguration(inferenceConfig)
                 .registerLanguage<lving.backend.cpg.language.LLVMIRLanguage>()
                 .registerPass<LLVMThreadPass>()
                 .registerPass<FunctionDeclarationPass>()
