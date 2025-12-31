@@ -1,4 +1,4 @@
 [submodule "cpg-thread-context"]
 	path = cpg-thread-context
-	url = https://github.com/denmarkx/cpg-thread-context
+	url = https://github.com/denmarkx/cpg-thread-context/
 	branch = lving-integration-thread
