@@ -36,25 +36,22 @@ package lving.backend.graph
 import de.fraunhofer.aisec.cpg.TranslationResult
 import de.fraunhofer.aisec.cpg.graph.Node
 import de.fraunhofer.aisec.cpg.graph.Persistable
-import de.fraunhofer.aisec.cpg.graph.blocks
-import de.fraunhofer.aisec.cpg.graph.declarations.FunctionDeclaration
-import de.fraunhofer.aisec.cpg.graph.declarations.VariableDeclaration
 import de.fraunhofer.aisec.cpg.graph.edges.collections.EdgeCollection
 import de.fraunhofer.aisec.cpg.graph.nodes
-import de.fraunhofer.aisec.cpg.graph.scopes.FunctionScope
-import de.fraunhofer.aisec.cpg.graph.statements.expressions.CallExpression
 import de.fraunhofer.aisec.cpg.helpers.Benchmark
-import de.fraunhofer.aisec.cpg.helpers.IdentitySet
-import de.fraunhofer.aisec.cpg.helpers.identitySetOf
-import de.fraunhofer.aisec.cpg.persistence.labels
 import de.fraunhofer.aisec.cpg.persistence.properties
 import de.fraunhofer.aisec.cpg.persistence.schemaRelationships
+import lving.backend.cpg.graph.getEdges
+import lving.backend.cpg.graph.getID
+import lving.backend.cpg.neo4j.connectedNodes
+import lving.backend.cpg.neo4j.filterAll
+import lving.backend.cpg.neo4j.filterEdges
+import lving.backend.cpg.neo4j.prepareProperties
 import org.neo4j.driver.Session
 import org.slf4j.LoggerFactory
 import java.util.WeakHashMap
 import kotlin.collections.iterator
 import kotlin.uuid.ExperimentalUuidApi
-import kotlin.uuid.Uuid
 
 private typealias Relationship = Map<String, Any?>
 private val log = LoggerFactory.getLogger("GraphBuilder")
@@ -79,23 +76,6 @@ const val edgeChunkSize = 10000
  */
 const val nodeChunkSize = 10000
 
-private val FILTERED_NODES = listOf("UnknownType")
-private val FILTERED_EDGES = listOf("LANGUAGE")
-
-// @llvm.declare.dbg calls from within Rust standard library are excluded from being walked.
-private val FILTERED_DBG_DECLARE_FUNCS = listOf(
-    "std::",
-    "core::",
-    "alloc::",
-    "proc_macro::",
-    "std_detect::",
-    "test::",
-    "__rust",
-    "__CxxFrame",
-    "llvm.",
-    "literal_",
-)
-
 /**
  * Persists the current [TranslationResult] into a graph database.
  *
@@ -115,14 +95,14 @@ private val FILTERED_DBG_DECLARE_FUNCS = listOf(
  *   configuration.
  * - A [Session] context to perform persistence actions.
  */
-context(Session)
+context(session: Session)
 fun TranslationResult.persistGraph(projectId: String) {
     val b = Benchmark(Persistable::class.java, "Persisting translation result")
 
     val astNodes = this@persistGraph.nodes
     val connected = astNodes.flatMap { it.connectedNodes }.toSet()
     val nodes = (astNodes + connected).distinct()
-    val idMap = nodes.persist(projectId)
+    nodes.persist(projectId)
 
     log.info(
         "Persisting {} nodes: AST nodes ({}), other nodes ({})",
@@ -131,7 +111,7 @@ fun TranslationResult.persistGraph(projectId: String) {
         connected.size,
     )
 
-    val relationships = nodes.collectRelationships(idMap)
+    val relationships = nodes.collectRelationships()
     log.info("Persisting {} relationships", relationships.size)
     relationships.persist(projectId)
 
@@ -157,102 +137,24 @@ fun TranslationResult.persistGraph(projectId: String) {
  *   configuration.
  * - A [Session] context to perform persistence actions.
  */
-context(Session)
-private fun List<Node>.persist(projectId: String): Map<Node, String> {
-    // node.properties is immutable and we need the ID for relationships.
-    val idMap = WeakHashMap<Node, String>(this.size)
-    val nodeLabelMap = WeakHashMap<Node, String>(this.filter { n -> n is VariableDeclaration }.size)
-
+context(session: Session)
+private fun List<Node>.persist(projectId: String) {
     this
-        .filter { it::class::labels.get().any { l -> !FILTERED_NODES.contains(l) } }
+        .filterAll()
         .chunked(nodeChunkSize).map { chunk ->
             val b = Benchmark(Persistable::class.java, "Persisting chunk of ${chunk.size} nodes")
             val params =
                 mapOf("props" to chunk.map {
                     // it.properties (ext. from persistable.kt) is immutable
                     // so unfortunately it has to be copied.
-                    val props = it.properties().toMutableMap()
-
-                    // Contrary to the actual name, Node.id is NOT UNIQUE.
-                    val id = Uuid.random().toString()
-                    props["id"] = id
-                    idMap[it] = id
-
-                    /*
-                    * just for the usability test / cypher generation
-                    * im 200% aware that this is not the most sane approach
-                    */
-
-                    // the most rational thing is to do this in a proper pass.
-                    var name = Demangle.demangle(props.getOrDefault("name", "") as String);
-
-                    // Scope has ZERO information from within the graph
-                    // except the nodes that is encased within it.
-                    // ..but from a general expansion, that explodes.
-                    if (it is FunctionScope) {
-                        name = Demangle.demangle(it.astNode!!.name.localName);
-                    }
-
-                    props["name"] = name;
-                    props["fullName"] = name;
-                    props["localName"] = name;
-
-                    if (it is FunctionDeclaration && !(FILTERED_DBG_DECLARE_FUNCS.any { s -> name.contains(s) })) {
-                        // tag a node that is interesting:
-                        // a node is interesting if it:
-                        //   - is a variabledeclaration
-                        //   - has a corresponding @llvm.dbg.declare
-                        //   - does NOT come from std:: or core::.
-                        it.blocks.forEach { b ->
-                            b.nodes
-                                .filter { n -> n is CallExpression && n.name.toString().equals("llvm.dbg.declare") }
-                                .forEach { n ->
-                                    // from llvm.debug.declare, the first argument is (metadata <type> <reg>, ...
-                                    // but this isn't interpreted properly when creating the graph. so, the first argument's node
-                                    // which is SUPPOSED to point back to the REAL node just points to unknown.
-                                    // we could walk back the EOG, but I haven't really found the best way to get
-                                    // back to the variabledeclaration since it may be directly or through assignexprs, etc.
-
-                                    // the approach i do right now to avoid handling every case:
-                                    // since it is guaranteed that llvm.dbg.declare's first arg is
-                                    // present within the same block, i just search for the name immediately following the %.
-                                    val declareNode = n as CallExpression
-                                    val code = declareNode.arguments[0].code
-                                    val split = code!!.split("%")
-                                    val varName = split.getOrNull(split.size - 1) ?: return@forEach
-
-                                    // find node:
-                                    val node: VariableDeclaration? = b.nodes.find { blockNode ->
-                                        blockNode is VariableDeclaration && blockNode.name.localName.equals(varName)
-                                    } as VariableDeclaration?
-
-                                    if (node == null) return@forEach
-
-                                    // since this isn't time to label the node, we wait for later.
-                                    // though, we'll save the reference to it.
-                                    nodeLabelMap[node] = "TrackedVariable"
-                                }
-                        }
-                    }
-
-                    // tag main:
-                    var extraLabels = mutableSetOf<String>()
-                    if (name.endsWith("::main")) {
-                        extraLabels.add("MainFunctionDeclaration");
-                    }
-
-                    // if we were in nodelabelmap:
-                    if (nodeLabelMap.contains(it)) {
-                        extraLabels.add(nodeLabelMap[it]!!);
-                        nodeLabelMap.remove(it);
-                    }
+                    val props = it.prepareProperties().toMutableMap()
 
                     // While we're here, set projectId on properties to avoid doing an extra pass later.
                     props["projectId"] = projectId
 
-                    mapOf("labels" to it::class.labels + extraLabels) + props
+                    mapOf("labels" to props["labels"]) + props
                 })
-            this@Session.executeWrite { tx ->
+            session.executeWrite { tx ->
                 tx.run(
                         """
                        UNWIND ${"$"}props AS map
@@ -266,7 +168,6 @@ private fun List<Node>.persist(projectId: String): Map<Node, String> {
             }
             b.stop()
         }
-    return idMap
 }
 
 /**
@@ -287,15 +188,15 @@ private fun List<Node>.persist(projectId: String): Map<Node, String> {
  * - Edges are chunked to avoid overloading transactional operations.
  * - Relationship properties and labels are mapped before using database utilities for creation.
  */
-context(Session)
+context(session: Session)
 private fun Collection<Relationship>.persist(projectId: String) {
     // Create an index for the "id" field of node, because we are "MATCH"ing on it in the edge
     // creation. We need to wait for this to be finished
-    this@Session.executeWrite { tx ->
+    session.executeWrite { tx ->
         tx.run("CREATE INDEX IF NOT EXISTS FOR (n:Node) ON (n.id)").consume()
     }
 
-    this.chunked(edgeChunkSize).map { chunk -> this@Session.createRelationships(chunk, projectId) }
+    this.chunked(edgeChunkSize).map { chunk -> session.createRelationships(chunk, projectId) }
 }
 
 /**
@@ -308,8 +209,7 @@ private fun Collection<Relationship>.persist(projectId: String) {
  */
 private fun Session.createRelationships(props: List<Relationship>, projectId: String) {
     val b = Benchmark(Persistable::class.java, "Persisting chunk of ${props.size} relationships")
-    val filteredProps = props
-        .filter { it["type"] !in FILTERED_EDGES }
+    val filteredProps = props.filterEdges()
     val params = mapOf(
         "props" to filteredProps,
         "projectId" to projectId,
@@ -332,30 +232,19 @@ private fun Session.createRelationships(props: List<Relationship>, projectId: St
     b.stop()
 }
 
-/**
- * Returns all [Node] objects that are connected with this node with some kind of relationship
- * defined in [schemaRelationships].
- */
-val Persistable.connectedNodes: IdentitySet<Node>
-    get() {
-        val nodes = identitySetOf<Node>()
-
-        for (entry in this::class.schemaRelationships) {
-            val value = entry.value.call(this)
-            if (value is EdgeCollection<*, *>) {
-                nodes += value.toNodeCollection()
-            } else if (value is List<*>) {
-                nodes += value.filterIsInstance<Node>()
-            } else if (value is Node) {
-                nodes += value
-            }
-        }
-
-        return nodes
-    }
-
-private fun List<Node>.collectRelationships(idMap: Map<Node, String>): List<Relationship> {
+private fun List<Node>.collectRelationships(): List<Relationship> {
     val relationships = mutableListOf<Relationship>()
+
+     // EdgeData:
+    getEdges().forEach {
+        it.value.forEach { v ->
+            relationships += mapOf(
+                "startId" to getID(v.start),
+                "endId" to getID(v.end),
+                "type" to it.key
+            )
+        }
+    }
 
     for (node in this) {
         for (entry in node::class.schemaRelationships) {
@@ -364,8 +253,8 @@ private fun List<Node>.collectRelationships(idMap: Map<Node, String>): List<Rela
                 relationships +=
                     value.map { edge ->
                         mapOf(
-                            "startId" to idMap[edge.start],
-                            "endId" to idMap[edge.end],
+                            "startId" to getID(edge.start),
+                            "endId" to getID(edge.end),
                             "type" to entry.key,
                         ) + edge.properties()
                     }
@@ -373,16 +262,16 @@ private fun List<Node>.collectRelationships(idMap: Map<Node, String>): List<Rela
                 relationships +=
                     value.filterIsInstance<Node>().map { end ->
                         mapOf(
-                            "startId" to idMap[node],
-                            "endId" to idMap[end],
+                            "startId" to getID(node),
+                            "endId" to getID(end),
                             "type" to entry.key,
                         )
                     }
             } else if (value is Node) {
                 relationships +=
                     mapOf(
-                        "startId" to idMap[node],
-                        "endId" to idMap[value],
+                        "startId" to getID(node),
+                        "endId" to getID(value),
                         "type" to entry.key,
                     )
             }

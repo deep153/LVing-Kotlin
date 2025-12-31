@@ -13,7 +13,13 @@ import org.neo4j.driver.Values
 import java.io.File
 import java.util.concurrent.ExecutionException
 import kotlinx.serialization.Serializable
+import lving.backend.cpg.passes.FunctionDeclarationPass
+import lving.backend.cpg.passes.FunctionPtrResolver
+import lving.backend.cpg.passes.LLVMThreadPass
+import lving.backend.cpg.passes.MemorySpacePass
+import lving.backend.cpg.passes.ScopePass
 import lving.backend.graph.persistGraph
+import lving.backend.cpg.language.handleDeferredDebugSpillNodes
 
 @Serializable
 data class GraphNode(
@@ -51,13 +57,19 @@ class CpgService {
             val translationConfig = TranslationConfiguration.builder()
                 .sourceLocations(listOf(llvmFile))
 //                .defaultPasses()
-                .registerLanguage<LLVMIRLanguage>()
+                .registerLanguage<lving.backend.cpg.language.LLVMIRLanguage>()
+                .registerPass<LLVMThreadPass>()
+                .registerPass<FunctionDeclarationPass>()
+                .registerPass<MemorySpacePass>()
+                .registerPass<ScopePass>()
+                .registerPass<FunctionPtrResolver>()
 //                .registerPass<ControlDependenceGraphPass>()
-                .registerPass<DynamicInvokeResolver>()
+//                .registerPass<DynamicInvokeResolver>()
                 .build()
 
             val translationManager = TranslationManager.builder().config(translationConfig).build()
             val result = translationManager.analyze().get()
+            handleDeferredDebugSpillNodes()
             println("CPG analysis successful. $result")
             return result
         } catch (e: ExecutionException) {
@@ -108,29 +120,11 @@ class CpgService {
         val neo4jPassword = System.getenv("NEO4J_PASSWORD") ?: "password"
         val uri = "bolt://$neo4jHost:7687"
 
-        // usb test
-        val forbiddenPatterns = listOf(
-            "\\bcreate\\b",
-            "\\bmerge\\b",
-            "\\bdelete\\b",
-            "\\bset\\b",
-            "\\bdrop\\b",
-            "\\bremove\\b",
-            "\\bcall.*dbms\\b"
-        )
-
-        if (forbiddenPatterns.any { Regex(it).containsMatchIn(cypherQuery) }) {
-            throw Exception("access");
-        }
-
         GraphDatabase.driver(uri, AuthTokens.basic(neo4jUser, neo4jPassword)).use { driver ->
             driver.session().use { session ->
                 return session.readTransaction { tx ->
                     // Inject projectId filter into the query
                     var modifiedQuery = injectProjectIdFilter(cypherQuery, projectId)
-
-                    // (usability test): limit at 150 nodes.
-                    modifiedQuery += "\nLIMIT 150";
 
                     println("Executing query: $modifiedQuery")
                     
@@ -169,13 +163,13 @@ class CpgService {
         // This is a basic implementation - for production, use a proper Cypher parser
         val lines = cypherQuery.split("\n")
         val modifiedLines = mutableListOf<String>()
-        val matchRgx = """MATCH \((\w+):""".toRegex()
+        val matchRgx = """MATCH\s?\(?(\w+)\s?:""".toRegex()
         val whereRgx = """WHERE (?:\w+\()?(\w+)""".toRegex()
         var injected = false
 
         for (line in lines) {
             modifiedLines.add(line)
-            val nodeName = matchRgx.find(line)?.destructured?.component1()
+            val nodeName = matchRgx.find(line)?.destructured?.component1() ?: continue
             if (!injected && line.trim().uppercase().startsWith("MATCH")) {
                 // Check if next line is WHERE, if not, inject
                 val nextLineIndex = lines.indexOf(line) + 1

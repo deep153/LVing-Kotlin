@@ -1,8 +1,9 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
-    kotlin("jvm") version "2.1.0"
-    kotlin("plugin.serialization") version "2.1.0"
+    kotlin("jvm") version "2.2.0"
+    kotlin("plugin.serialization") version "2.2.0"
     application
 }
 
@@ -36,13 +37,17 @@ dependencies {
     implementation("redis.clients:jedis:5.1.3")
 
     // CPG Libraries
-    val cpgVersion = "10.8.0"
+    val cpgVersion = "10.8.2"
     implementation("de.fraunhofer.aisec:cpg-core:${cpgVersion}")
     implementation("de.fraunhofer.aisec:cpg-language-llvm:${cpgVersion}")
     implementation("de.fraunhofer.aisec:cpg-neo4j:${cpgVersion}")
 
     // Neo4j Java Driver
     implementation("org.neo4j.driver:neo4j-java-driver:5.22.0")
+
+    implementation("org.jetbrains.kotlin:kotlin-stdlib:2.2.0")
+    implementation("org.neo4j:neo4j-ogm-core:5.0.0")
+    implementation("org.bytedeco:llvm-platform:20.1.7-1.5.12")
 }
 
 application {
@@ -50,9 +55,21 @@ application {
 }
 
 tasks.withType<KotlinCompile> {
-    kotlinOptions {
-        jvmTarget = "21"
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_21)
         // Enable context receivers for CPG's persist() function
-        freeCompilerArgs = listOf("-Xcontext-receivers")
+        freeCompilerArgs.set(listOf("-Xcontext-parameters", "-Xmulti-dollar-strings"))
     }
+}
+
+sourceSets {
+    main {
+        kotlin {
+            srcDir("../cpg-thread-context/src/main/kotlin")
+        }
+    }
+}
+val compileKotlin: KotlinCompile by tasks
+compileKotlin.compilerOptions {
+    freeCompilerArgs.set(listOf("-Xcontext-parameters"))
 }

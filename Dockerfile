@@ -21,6 +21,7 @@ RUN gradle :app:dependencies --no-daemon
 
 # Now copy the rest of the source code
 COPY app/src ./app/src
+COPY cpg-thread-context ./cpg-thread-context
 
 # Copy built frontend from the previous stage
 COPY --from=frontend-builder /app/dist ./app/src/main/resources/static
@@ -33,8 +34,8 @@ FROM eclipse-temurin:21-jre
 
 # Install rustc and LLVM development libraries for CPG
 RUN apt-get update && \
-    apt-get install -y curl build-essential llvm-16 llvm-16-dev && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.55.0 && \
+    apt-get install -y curl build-essential llvm-20 llvm-20-dev && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -42,7 +43,7 @@ RUN apt-get update && \
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Set Java library path to include LLVM libraries
-ENV LD_LIBRARY_PATH="/usr/lib/llvm-16/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/usr/lib/llvm-20/lib:${LD_LIBRARY_PATH}"
 
 WORKDIR /app
 COPY --from=backend-builder /home/gradle/src/app/build/install/app ./
